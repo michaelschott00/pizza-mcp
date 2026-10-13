@@ -1,0 +1,25 @@
+services:
+  agent:
+    build: .
+    volumes:
+      - type: bind
+        source: ${PWD}
+        target: /workspaces/project
+      - type: volume
+        source: worktrees
+        target: /workspaces/worktrees
+      - type: bind
+        source: ~/.config/opencode
+        target: /home/agent/.config/opencode
+      - type: bind
+        source: ~/.local/share/opencode
+        target: /home/agent/.local/share/opencode
+      - type: bind
+        source: ~/.local/state/opencode
+        target: /home/agent/.local/state/opencode
+    ports:
+      - "6274:6274"
+      - "6275:6275"
+
+volumes:
+  worktrees:
