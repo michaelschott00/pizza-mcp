@@ -5,9 +5,9 @@ two MCP features:
 
 * elicitation - every prompt is asked through the SDK's elicitation support
   (via `Resolve`/`Elicit` resolvers, which work on every protocol version).
-* progressive tool discovery - only the tools for the current stage are exposed
-  to the client. When the stage changes the server swaps the registered tools
-  and sends a `notifications/tools/list_changed` so the client re-fetches them.
+* stage-gated tools - every tool is always exposed to the client, but each one
+  refuses to run (with an informative error) unless the interview is currently
+  in the stage it belongs to.
 """
 
 from __future__ import annotations
@@ -21,20 +21,21 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver import (
     AcceptedElicitation,
     ElicitationResult,
-    Context,
     Elicit,
     Resolve,
 )
+from mcp.server.mcpserver.exceptions import ToolError
 
 server = MCPServer(
     "pizza",
     title="Pizza MCP Server",
     instructions=(
         "Guide the customer through an interactive pizza ordering interview. "
-        "Only the tools for the current stage are available, so call the tool that "
-        "is currently exposed and answer the prompts it presents. The stages are: "
-        "greeting, ordering, pizza-making, and feedback. When a stage completes the "
-        "tool list changes - re-fetch it to see the next stage's tools."
+        "Every tool is always available, but each tool only works during the stage "
+        "it belongs to. Calling a tool outside its stage returns an error telling "
+        "you which stage the interview is currently in and which tools to call to "
+        "reach the stage you need. The stages are: greeting, "
+        "ordering, pizza-making, and feedback."
     ),
 )
 
@@ -46,8 +47,79 @@ class Stage(Enum):
     FEEDBACK = auto()
 
 
+STAGE_LABELS: dict[Stage, str] = {
+    Stage.GREETING: "greeting",
+    Stage.ORDER: "ordering",
+    Stage.PIZZA_MAKING: "pizza-making",
+    Stage.FEEDBACK: "feedback",
+}
+
+STAGE_TRANSITIONS: dict[Stage, tuple[Stage, str]] = {
+    Stage.GREETING: (Stage.ORDER, "greet_customer"),
+    Stage.ORDER: (Stage.PIZZA_MAKING, "take_order"),
+    Stage.PIZZA_MAKING: (Stage.FEEDBACK, "serve_pizza"),
+    Stage.FEEDBACK: (Stage.GREETING, "collect_feedback"),
+}
+
+PIZZA_STEPS: list[str] = ["make_dough", "spread_dough", "add_topings", "bake_pizza", "serve_pizza"]
+
 current_stage = Stage.GREETING
+pizza_step = 0
 order: dict[str, Any] = {}
+
+
+def _enter_stage(stage: Stage) -> None:
+    """Move the interview to `stage`."""
+    global current_stage, pizza_step
+    current_stage = stage
+    if stage is Stage.PIZZA_MAKING:
+        pizza_step = 0
+
+
+def _advancing_tools(target: Stage, tool_name: str | None = None) -> list[str]:
+    """The tools to call, in order, to move the interview from the current stage to `target`."""
+    tools: list[str] = []
+    stage = current_stage
+    for _ in range(len(STAGE_TRANSITIONS)):
+        if stage is target:
+            break
+        next_stage, tool = STAGE_TRANSITIONS[stage]
+        if stage is Stage.PIZZA_MAKING:
+            tools.extend(PIZZA_STEPS[:-1])
+        tools.append(tool)
+        stage = next_stage
+    if target is Stage.PIZZA_MAKING and tool_name in PIZZA_STEPS:
+        tools.extend(PIZZA_STEPS[: PIZZA_STEPS.index(tool_name)])
+    return tools
+
+
+def _require_stage(stage: Stage, tool_name: str | None = None) -> None:
+    """Fail with an informative error unless the interview is in `stage`."""
+    if current_stage is stage:
+        return
+
+    steps = _advancing_tools(stage, tool_name)
+    path = ", then ".join(f"`{name}`" for name in steps)
+    raise ToolError(
+        f"This tool is only available during the {STAGE_LABELS[stage]} stage, "
+        f"but the interview is currently in the {STAGE_LABELS[current_stage]} stage. "
+        f"Call {path} to advance to where this tool can be used."
+    )
+
+
+def _require_pizza_step(name: str) -> None:
+    """Fail unless the interview is making pizza and `name` is the next step."""
+    _require_stage(Stage.PIZZA_MAKING, name)
+    expected = PIZZA_STEPS[pizza_step]
+    if name != expected:
+        raise ToolError(
+            f"The pizza-making steps must be called in order. The next step is `{expected}`."
+        )
+
+
+def _complete_pizza_step() -> None:
+    global pizza_step
+    pizza_step += 1
 
 
 # --------------------------------------------------------------------------- #
@@ -62,14 +134,17 @@ class Greeting(BaseModel):
 
 
 async def greet_resolver() -> Elicit[Greeting] | Greeting:
+    _require_stage(Stage.GREETING)
     return Elicit("Welcome to Pizza MCP! Before we begin, a few quick questions.", Greeting)
 
 
 async def greet_customer(
     answers: Annotated[ElicitationResult[Greeting], Resolve(greet_resolver)],
-    ctx: Context,
 ) -> str:
-    """Greet the customer and ask how they are, how they arrived, and whether they want pizza."""
+    """Greet the customer and ask how they are, how they arrived, and whether they want pizza.
+
+    Available during the greeting stage.
+    """
     if not isinstance(answers, AcceptedElicitation):
         return "No problem. Come back whenever you feel like a pizza!"
 
@@ -80,7 +155,7 @@ async def greet_customer(
             "Maybe next time you'll want a pizza."
         )
 
-    await _enter_stage(Stage.ORDER, ctx)
+    _enter_stage(Stage.ORDER)
     return (
         f"Great, a pizza it is! Arriving by {data.arrival}, that works. "
         "Let's put your order together."
@@ -103,22 +178,25 @@ class Order(BaseModel):
 
 
 async def order_resolver() -> Elicit[Order] | Order:
+    _require_stage(Stage.ORDER)
     return Elicit("Let's build your pizza.", Order)
 
 
 async def take_order(
     answers: Annotated[ElicitationResult[Order], Resolve(order_resolver)],
-    ctx: Context,
 ) -> str:
-    """Take the pizza order: crust filling, pizza type, and any extras."""
+    """Take the pizza order: crust filling, pizza type, and any extras.
+
+    Available during the ordering stage.
+    """
     if not isinstance(answers, AcceptedElicitation):
-        await _enter_stage(Stage.GREETING, ctx)
+        _enter_stage(Stage.GREETING)
         return "Order cancelled. Let me know if you change your mind."
 
     data = answers.data
     order.update(crust=data.crust, pizza_type=data.pizza_type, extras=data.extras)
 
-    await _enter_stage(Stage.PIZZA_MAKING, ctx)
+    _enter_stage(Stage.PIZZA_MAKING)
     extras = f" plus {data.extras}" if data.extras else ""
     return f"One {data.pizza_type} with {data.crust}{extras}. Let's make it!"
 
@@ -129,30 +207,55 @@ async def take_order(
 
 
 async def make_dough() -> str:
-    """Make the dough for the pizza."""
+    """Make the dough for the pizza.
+
+    Available during the pizza-making stage, as step 1 of 5.
+    """
+    _require_pizza_step("make_dough")
+    _complete_pizza_step()
     return f"Kneading the dough for a {order.get('pizza_type', 'pizza')}."
 
 
 async def spread_dough() -> str:
-    """Spread and shape the dough."""
+    """Spread and shape the dough.
+
+    Available during the pizza-making stage, as step 2 of 5.
+    """
+    _require_pizza_step("spread_dough")
+    _complete_pizza_step()
     return "Spreading the dough into a nice round base."
 
 
 async def add_topings() -> str:
-    """Add the toppings to the pizza."""
+    """Add the toppings to the pizza.
+
+    Available during the pizza-making stage, as step 3 of 5.
+    """
+    _require_pizza_step("add_topings")
+    _complete_pizza_step()
     extras = order.get("extras")
     extra_note = f" Adding your extras: {extras}." if extras else ""
     return f"Adding tomato, mozzarella and friends.{extra_note}"
 
 
 async def bake_pizza() -> str:
-    """Bake the pizza in the oven."""
+    """Bake the pizza in the oven.
+
+    Available during the pizza-making stage, as step 4 of 5.
+    """
+    _require_pizza_step("bake_pizza")
+    _complete_pizza_step()
     return "Baking the pizza until the crust is golden."
 
 
-async def serve_pizza(ctx: Context) -> str:
-    """Serve the finished pizza and move on to the feedback stage."""
-    await _enter_stage(Stage.FEEDBACK, ctx)
+async def serve_pizza() -> str:
+    """Serve the finished pizza and move on to the feedback stage.
+
+    Available during the pizza-making stage, as step 5 of 5.
+    """
+    _require_pizza_step("serve_pizza")
+    _complete_pizza_step()
+    _enter_stage(Stage.FEEDBACK)
     return "Here is your pizza! Buon appetito."
 
 
@@ -167,16 +270,19 @@ class Feedback(BaseModel):
 
 
 async def feedback_resolver() -> Elicit[Feedback] | Feedback:
+    _require_stage(Stage.FEEDBACK)
     return Elicit("Before you go, how was your experience?", Feedback)
 
 
 async def collect_feedback(
     answers: Annotated[ElicitationResult[Feedback], Resolve(feedback_resolver)],
-    ctx: Context,
 ) -> str:
-    """Ask whether the customer liked their experience and collect any comments."""
+    """Ask whether the customer liked their experience and collect any comments.
+
+    Available during the feedback stage.
+    """
     if not isinstance(answers, AcceptedElicitation):
-        await _enter_stage(Stage.GREETING, ctx)
+        _enter_stage(Stage.GREETING)
         return "Thanks for visiting!"
 
     data = answers.data
@@ -184,12 +290,12 @@ async def collect_feedback(
     if data.comments:
         closing += f" Your feedback: {data.comments}"
 
-    await _enter_stage(Stage.GREETING, ctx)
+    _enter_stage(Stage.GREETING)
     return closing
 
 
 # --------------------------------------------------------------------------- #
-# Progressive tool discovery
+# Tool registration
 # --------------------------------------------------------------------------- #
 
 STAGE_TOOLS: dict[Stage, list[Callable[..., Any]]] = {
@@ -200,27 +306,15 @@ STAGE_TOOLS: dict[Stage, list[Callable[..., Any]]] = {
 }
 
 
-async def _enter_stage(stage: Stage, ctx: Context) -> None:
-    """Swap the exposed tools to match `stage` and tell the client the list changed."""
-    global current_stage
-
-    for fn in STAGE_TOOLS[current_stage]:
-        server.remove_tool(fn.__name__)
-    current_stage = stage
-    for fn in STAGE_TOOLS[stage]:
-        server.add_tool(fn)
-
-    await ctx.session.send_tool_list_changed()
-    await ctx.notify_tools_changed()
-
-
-def _register_initial_stage() -> None:
+def _register_tools() -> None:
+    """Expose every tool up front; stage gating happens inside each tool."""
     order.clear()
-    for fn in STAGE_TOOLS[Stage.GREETING]:
-        server.add_tool(fn)
+    for tools in STAGE_TOOLS.values():
+        for fn in tools:
+            server.add_tool(fn)
 
 
-_register_initial_stage()
+_register_tools()
 
 
 def main() -> None:
