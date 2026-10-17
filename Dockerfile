@@ -37,13 +37,15 @@ RUN --mount=type=cache,target=/tmp/install-cache \
 # Install the MCP inspector globally
 RUN npm install -g @modelcontextprotocol/inspector
 
-# Override python interpreter entrypoint of base image
-ENTRYPOINT ["/bin/bash"]
-
 # Add unprivileged agent user
 RUN useradd -u ${AGENT_UID} -m ${AGENT_USER} \
     && chown -R ${AGENT_UID}:${AGENT_UID} /home/${AGENT_USER} \
     && mkdir -p /home/agent/.config && chown -R ${AGENT_UID}:${AGENT_UID} /home/agent/.config \
     && mkdir -p /home/agent/.local && chown -R ${AGENT_UID}:${AGENT_UID} /home/agent/.local \
     && mkdir -p /workspaces/worktrees && chown -R ${AGENT_UID}:${AGENT_UID} /workspaces/worktrees
+
+COPY mcp.json /home/${AGENT_USER}/.mcp-inspector/mcp.json
+RUN chown -R ${AGENT_UID}:${AGENT_UID} /home/${AGENT_USER}/.mcp-inspector
 USER ${AGENT_USER}
+
+ENTRYPOINT ["/bin/bash"]

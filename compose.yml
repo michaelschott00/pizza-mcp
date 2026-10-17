@@ -1,5 +1,5 @@
 services:
-  agent:
+  dev:
     build: .
     volumes:
       - type: bind
@@ -18,8 +18,15 @@ services:
         source: ~/.local/state/opencode
         target: /home/agent/.local/state/opencode
     ports:
-      - "6274:6274"
-      - "6275:6275"
+      - "127.0.0.1:6274:6274"
+      - "127.0.0.1:6275:6275"
+    environment:
+      - DANGEROUSLY_OMIT_AUTH=true
+      - HOST=0.0.0.0
+      - DANGEROUSLY_BIND_ALL_INTERFACES=true
+      - ALLOWED_ORIGINS=http://localhost:6274
+    entrypoint: []
+    command: mcp-inspector
 
 volumes:
   worktrees:

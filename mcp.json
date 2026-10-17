@@ -1,8 +1,9 @@
 {
   "mcpServers": {
     "my-stdio-server": {
+      "type": "stdio",
       "command": "python",
-      "args": ["/app/main.py"]
+      "args": ["/workspaces/project/main.py"]
     }
   }
 }
