@@ -1,5 +1,7 @@
 FROM python:3.12
 
+ARG OPENCODE_VERSION=2.0.31
+ARG OPENCODE_INSTALL_URL=https://opencode.ai/v2/install
 ARG AGENT_USER=agent
 ARG AGENT_UID=1000
 WORKDIR /workspaces/project
@@ -21,7 +23,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Install opencode (or other harnesses)
 RUN --mount=type=cache,target=/tmp/install-cache \
-    curl -fsSL https://opencode.ai/install -o /tmp/install-cache/install.sh \
+    curl -fsSL ${OPENCODE_INSTALL_URL} -o /tmp/install-cache/install.sh \
     && HOME=/home/${AGENT_USER} bash /tmp/install-cache/install.sh
 ENV PATH="${PATH}:/home/${AGENT_USER}/.opencode/bin/"
 

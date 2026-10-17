@@ -3,8 +3,12 @@
 A toy MCP server that runs an interactive pizza-order interview. It demonstrates
 two MCP features:
 
-* elicitation - every prompt is asked through the SDK's elicitation support
-  (via `Resolve`/`Elicit` resolvers, which work on every protocol version).
+* elicitation, with a fallback - prompts are asked through the SDK's
+  elicitation support (via `Resolve`/`Elicit` resolvers, which work on every
+  protocol version). Clients that do not declare the elicitation capability
+  are not asked directly: the tool returns a message telling the client to pose
+  the question to the user, and accepts the answers back through its optional
+  `answers` argument so the interview can continue.
 * stage-gated tools - every tool is always exposed to the client, but each one
   refuses to run (with an informative error) unless the interview is currently
   in the stage it belongs to.
@@ -20,6 +24,7 @@ from pydantic import BaseModel, Field
 from mcp.server import MCPServer
 from mcp.server.mcpserver import (
     AcceptedElicitation,
+    Context,
     ElicitationResult,
     Elicit,
     Resolve,
@@ -34,8 +39,10 @@ server = MCPServer(
         "Every tool is always available, but each tool only works during the stage "
         "it belongs to. Calling a tool outside its stage returns an error telling "
         "you which stage the interview is currently in and which tools to call to "
-        "reach the stage you need. The stages are: greeting, "
-        "ordering, pizza-making, and feedback."
+        "reach the stage you need. Questions are asked through elicitation when the "
+        "client supports it; otherwise the tool returns the questions, you ask the "
+        "user, and you call the tool again with the answers in its `answers` argument. "
+        "The stages are: greeting, ordering, pizza-making, and feedback."
     ),
 )
 
@@ -123,6 +130,67 @@ def _complete_pizza_step() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Elicitation support
+# --------------------------------------------------------------------------- #
+
+
+class ElicitationUnsupported(BaseModel):
+    """Payload used in place of an elicitation when the client cannot answer one."""
+
+    message: str
+
+
+def _supports_elicitation(ctx: Context) -> bool:
+    """Whether the connected client declared it can answer form elicitation requests.
+
+    Mirrors the SDK's own capability gate: a bare `elicitation: {}` counts as form
+    support, while URL-only elicitation does not.
+    """
+    try:
+        capabilities = ctx.client_capabilities
+    except ValueError:
+        # Outside an active request there is no client to ask.
+        return False
+    elicitation = capabilities.elicitation if capabilities is not None else None
+    return elicitation is not None and (elicitation.form is not None or elicitation.url is None)
+
+
+def _render_questions(schema: type[BaseModel]) -> str:
+    """The fields of `schema`, rendered as the questions to put to the user."""
+    return "\n".join(f"- {field.description or name}" for name, field in schema.model_fields.items())
+
+
+def _elicit_or_message(
+    ctx: Context, prompt: str, schema: type[BaseModel], provided: BaseModel | None
+) -> Elicit[Any] | BaseModel:
+    """Ask `schema` through elicitation, use pre-supplied `provided` answers, or return a message.
+
+    Clients that support elicitation are always asked directly. A client that cannot
+    answer an elicitation can instead call the tool again with its `answers` argument;
+    until it does, the tool returns a message telling it to pose the questions to the user.
+    """
+    if _supports_elicitation(ctx):
+        return Elicit(prompt, schema)
+    if provided is not None:
+        return provided
+    return ElicitationUnsupported(
+        message=(
+            "This client does not support MCP elicitation, so this server cannot ask "
+            "the user directly. Please pose the following question(s) to the user, then "
+            "call this tool again with the `answers` argument:\n"
+            f"{prompt}\n{_render_questions(schema)}"
+        )
+    )
+
+
+def _unsupported_message(result: ElicitationResult[Any]) -> str | None:
+    """The fallback message when `result` is an `ElicitationUnsupported` payload."""
+    if isinstance(result, AcceptedElicitation) and isinstance(result.data, ElicitationUnsupported):
+        return result.data.message
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # Stage 1: greeting
 # --------------------------------------------------------------------------- #
 
@@ -133,22 +201,30 @@ class Greeting(BaseModel):
     wants_pizza: bool = Field(description="Would you like to order a pizza?")
 
 
-async def greet_resolver() -> Elicit[Greeting] | Greeting:
+async def greet_resolver(
+    ctx: Context, answers: Greeting | None
+) -> Elicit[Greeting] | Greeting | ElicitationUnsupported:
     _require_stage(Stage.GREETING)
-    return Elicit("Welcome to Pizza MCP! Before we begin, a few quick questions.", Greeting)
+    return _elicit_or_message(ctx, "Welcome to Pizza MCP!", Greeting, answers)
 
 
 async def greet_customer(
-    answers: Annotated[ElicitationResult[Greeting], Resolve(greet_resolver)],
+    result: Annotated[ElicitationResult[Greeting], Resolve(greet_resolver)],
+    answers: Greeting | None = None,
 ) -> str:
     """Greet the customer and ask how they are, how they arrived, and whether they want pizza.
 
-    Available during the greeting stage.
+    Available during the greeting stage. `answers` is only needed by clients without
+    elicitation support: such a client asks the user the questions it is handed, then
+    calls this tool again with `answers` filled in.
     """
-    if not isinstance(answers, AcceptedElicitation):
+    if (message := _unsupported_message(result)) is not None:
+        return message
+
+    if not isinstance(result, AcceptedElicitation):
         return "No problem. Come back whenever you feel like a pizza!"
 
-    data = answers.data
+    data = result.data
     if not data.wants_pizza:
         return (
             f"Thanks for stopping by and {data.feeling or 'take care'}! "
@@ -177,23 +253,31 @@ class Order(BaseModel):
     extras: str = Field(default="", description="Anything else? Leave blank for none.")
 
 
-async def order_resolver() -> Elicit[Order] | Order:
+async def order_resolver(
+    ctx: Context, answers: Order | None
+) -> Elicit[Order] | Order | ElicitationUnsupported:
     _require_stage(Stage.ORDER)
-    return Elicit("Let's build your pizza.", Order)
+    return _elicit_or_message(ctx, "Let's build your pizza.", Order, answers)
 
 
 async def take_order(
-    answers: Annotated[ElicitationResult[Order], Resolve(order_resolver)],
+    result: Annotated[ElicitationResult[Order], Resolve(order_resolver)],
+    answers: Order | None = None,
 ) -> str:
     """Take the pizza order: crust filling, pizza type, and any extras.
 
-    Available during the ordering stage.
+    Available during the ordering stage. `answers` is only needed by clients without
+    elicitation support: such a client asks the user the questions it is handed, then
+    calls this tool again with `answers` filled in.
     """
-    if not isinstance(answers, AcceptedElicitation):
+    if (message := _unsupported_message(result)) is not None:
+        return message
+
+    if not isinstance(result, AcceptedElicitation):
         _enter_stage(Stage.GREETING)
         return "Order cancelled. Let me know if you change your mind."
 
-    data = answers.data
+    data = result.data
     order.update(crust=data.crust, pizza_type=data.pizza_type, extras=data.extras)
 
     _enter_stage(Stage.PIZZA_MAKING)
@@ -269,23 +353,31 @@ class Feedback(BaseModel):
     comments: str = Field(default="", description="Anything you'd like to say? Leave blank for none.")
 
 
-async def feedback_resolver() -> Elicit[Feedback] | Feedback:
+async def feedback_resolver(
+    ctx: Context, answers: Feedback | None
+) -> Elicit[Feedback] | Feedback | ElicitationUnsupported:
     _require_stage(Stage.FEEDBACK)
-    return Elicit("Before you go, how was your experience?", Feedback)
+    return _elicit_or_message(ctx, "Before you go, how was your experience?", Feedback, answers)
 
 
 async def collect_feedback(
-    answers: Annotated[ElicitationResult[Feedback], Resolve(feedback_resolver)],
+    result: Annotated[ElicitationResult[Feedback], Resolve(feedback_resolver)],
+    answers: Feedback | None = None,
 ) -> str:
     """Ask whether the customer liked their experience and collect any comments.
 
-    Available during the feedback stage.
+    Available during the feedback stage. `answers` is only needed by clients without
+    elicitation support: such a client asks the user the questions it is handed, then
+    calls this tool again with `answers` filled in.
     """
-    if not isinstance(answers, AcceptedElicitation):
+    if (message := _unsupported_message(result)) is not None:
+        return message
+
+    if not isinstance(result, AcceptedElicitation):
         _enter_stage(Stage.GREETING)
         return "Thanks for visiting!"
 
-    data = answers.data
+    data = result.data
     closing = "Grazie! We're glad you enjoyed it." if data.liked else "Sorry to hear that - we'll do better."
     if data.comments:
         closing += f" Your feedback: {data.comments}"
