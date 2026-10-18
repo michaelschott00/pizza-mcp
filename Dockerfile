@@ -41,10 +41,16 @@ RUN npm install -g @modelcontextprotocol/inspector
 RUN useradd -u ${AGENT_UID} -m ${AGENT_USER} \
     && chown -R ${AGENT_UID}:${AGENT_UID} /home/${AGENT_USER} \
     && mkdir -p /home/agent/.config && chown -R ${AGENT_UID}:${AGENT_UID} /home/agent/.config \
-    && mkdir -p /home/agent/.local && chown -R ${AGENT_UID}:${AGENT_UID} /home/agent/.local
+    && mkdir -p /home/agent/.local && chown -R ${AGENT_UID}:${AGENT_UID} /home/agent/.local \
+    && mkdir -p /tmp/opencode && chown -R ${AGENT_UID}:${AGENT_UID} /tmp/opencode
 
-COPY mcp.json /home/${AGENT_USER}/.mcp-inspector/mcp.json
-RUN chown -R ${AGENT_UID}:${AGENT_UID} /home/${AGENT_USER}/.mcp-inspector
+# The MCP Inspector config is bind-mounted from the repository (see compose.yml)
+# so servers and flags can be changed without rebuilding the image. Create the
+# mount point here: a missing target would otherwise be created as a directory,
+# which a file mount cannot use.
+RUN mkdir -p /home/${AGENT_USER}/.mcp-inspector \
+    && touch /home/${AGENT_USER}/.mcp-inspector/mcp.json \
+    && chown -R ${AGENT_UID}:${AGENT_UID} /home/${AGENT_USER}/.mcp-inspector
 USER ${AGENT_USER}
 
 ENTRYPOINT ["/bin/bash"]

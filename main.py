@@ -13,10 +13,15 @@ two MCP features:
 * stage-gated tools - every tool is always exposed to the client, but each one
   refuses to run (with an informative error) unless the interview is currently
   in the stage it belongs to.
+
+Pass `--no-elicitation` to force the answers-based tools even for clients that
+advertise elicitation support (useful for testing the fallback with clients
+such as MCP Inspector). Elicitation support is enabled by default.
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 from dataclasses import replace
 from enum import Enum, auto
@@ -433,6 +438,11 @@ OWNERS: dict[str, Toolset] = {
     registered: toolset for toolset in TOOLSETS.values() for registered in toolset.advertise
 }
 
+# Whether the server may use elicitation at all. `--no-elicitation` clears this,
+# forcing the answers-based toolset on every client - including those that
+# advertise elicitation support, such as MCP Inspector.
+ELICITATION_ENABLED = True
+
 
 def advertised_name(name: str, supports_elicitation: bool) -> str | None:
     """The name a registered tool is exposed under to a client, or None when hidden."""
@@ -487,7 +497,7 @@ async def capability_middleware(ctx: ServerRequestContext[Any, Any], call_next: 
     if ctx.method not in ("tools/list", "tools/call"):
         return await call_next(ctx)
 
-    supports = _client_supports_elicitation(ctx)
+    supports = ELICITATION_ENABLED and _client_supports_elicitation(ctx)
     active = TOOLSETS[supports]
 
     if ctx.method == "tools/call":
@@ -573,7 +583,29 @@ def _configure_telemetry() -> TracerProvider:
     return provider
 
 
-def main() -> None:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse the server's command-line options."""
+    parser = argparse.ArgumentParser(
+        prog="main.py",
+        description="Run the Pizza MCP server over stdio.",
+    )
+    parser.add_argument(
+        "--elicitation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "use the elicitation-based tools with clients that support elicitation "
+            "(default: enabled); --no-elicitation forces the answers-based tools"
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    global ELICITATION_ENABLED
+    args = _parse_args(argv)
+    ELICITATION_ENABLED = args.elicitation
+
     provider = _configure_telemetry()
     try:
         server.run()

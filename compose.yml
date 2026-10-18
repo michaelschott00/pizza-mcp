@@ -6,6 +6,9 @@ services:
         source: ${PWD}
         target: /workspaces/project
       - type: bind
+        source: ${PWD}/mcp-inspector
+        target: /home/agent/.mcp-inspector
+      - type: bind
         source: ~/.config/opencode
         target: /home/agent/.config/opencode
       - type: bind

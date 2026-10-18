@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "pizza-mcp-elicitation": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["/workspaces/project/main.py"]
+    },
+    "pizza-mcp-no-elicitation": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["/workspaces/project/main.py", "--no-elicitation"]
+    }
+  }
+}
