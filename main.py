@@ -17,10 +17,16 @@ two MCP features:
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from enum import Enum, auto
 from typing import Annotated, Any, Callable, Literal
 
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from pydantic import BaseModel, Field
 
 from mcp.server import MCPServer
@@ -476,8 +482,45 @@ def _register_tools() -> None:
 _register_tools()
 
 
+# --------------------------------------------------------------------------- #
+# Telemetry
+# --------------------------------------------------------------------------- #
+#
+# The SDK already emits one OpenTelemetry span per inbound message, but with no
+# tracer provider registered those spans are discarded. Installing the SDK and
+# the OTLP exporter (see `requirements.txt`) and registering them below ships
+# the spans to the collector defined in `compose.yml`.
+
+# The collector runs as the `otel` service, so it is reached by name from the
+# compose network, not via localhost.
+DEFAULT_OTLP_ENDPOINT = "http://otel:4317"
+SERVICE_NAME = "pizza"
+
+
+def _configure_telemetry() -> TracerProvider:
+    """Ship the spans the SDK emits to the OTLP collector from `compose.yml`.
+
+    The endpoint defaults to the collector's gRPC receiver and can be overridden
+    with the standard `OTEL_EXPORTER_OTLP_ENDPOINT` (or
+    `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`) environment variables.
+    """
+    endpoint = os.environ.get(
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", DEFAULT_OTLP_ENDPOINT),
+    )
+    provider = TracerProvider(resource=Resource.create({"service.name": SERVICE_NAME}))
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
+    trace.set_tracer_provider(provider)
+    return provider
+
+
 def main() -> None:
-    server.run()
+    provider = _configure_telemetry()
+    try:
+        server.run()
+    finally:
+        # Flush the spans the batch processor has buffered before exiting.
+        provider.shutdown()
 
 
 if __name__ == "__main__":
