@@ -3,12 +3,13 @@
 A toy MCP server that runs an interactive pizza-order interview. It demonstrates
 two MCP features:
 
-* elicitation, with a fallback - prompts are asked through the SDK's
-  elicitation support (via `Resolve`/`Elicit` resolvers, which work on every
-  protocol version). Clients that do not declare the elicitation capability
-  are not asked directly: the tool returns a message telling the client to pose
-  the question to the user, and accepts the answers back through its optional
-  `answers` argument so the interview can continue.
+* elicitation, with a capability-aware fallback - the interview questions are
+  asked through the SDK's elicitation support (via `Resolve`/`Elicit` resolvers,
+  which work on every protocol version). Clients that cannot answer elicitation
+  requests are served a different set of tools whose questions travel through an
+  `answers` argument instead. Which set a client receives is decided from the
+  capabilities it declares when it connects, so neither the tools nor the
+  instructions have to mention the distinction.
 * stage-gated tools - every tool is always exposed to the client, but each one
   refuses to run (with an informative error) unless the interview is currently
   in the stage it belongs to.
@@ -16,17 +17,18 @@ two MCP features:
 
 from __future__ import annotations
 
+from dataclasses import replace
 from enum import Enum, auto
 from typing import Annotated, Any, Callable, Literal
 
 from pydantic import BaseModel, Field
 
 from mcp.server import MCPServer
+from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
 from mcp.server.mcpserver import (
     AcceptedElicitation,
-    Context,
-    ElicitationResult,
     Elicit,
+    ElicitationResult,
     Resolve,
 )
 from mcp.server.mcpserver.exceptions import ToolError
@@ -39,10 +41,8 @@ server = MCPServer(
         "Every tool is always available, but each tool only works during the stage "
         "it belongs to. Calling a tool outside its stage returns an error telling "
         "you which stage the interview is currently in and which tools to call to "
-        "reach the stage you need. Questions are asked through elicitation when the "
-        "client supports it; otherwise the tool returns the questions, you ask the "
-        "user, and you call the tool again with the answers in its `answers` argument. "
-        "The stages are: greeting, ordering, pizza-making, and feedback."
+        "reach the stage you need. The stages are: greeting, ordering, "
+        "pizza-making, and feedback."
     ),
 )
 
@@ -130,64 +130,119 @@ def _complete_pizza_step() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Elicitation support
+# Capability-aware tool exposure
 # --------------------------------------------------------------------------- #
+#
+# Every tool that asks the user a question is registered twice: once as a
+# canonical tool that asks through elicitation, and once as a `<name>_answers`
+# counterpart for clients that cannot answer elicitation requests (its questions
+# come back through the tool's `answers` argument). The middleware below decides
+# per connection which of the two a client is shown - and which one runs when it
+# calls the canonical name - from the capabilities it declared on connect.
+
+ANSWER_TOOL_SUFFIX = "_answers"
+
+# The canonical names of the tools that have an `_answers` counterpart.
+ELICITING_TOOL_NAMES = frozenset({"greet_customer", "take_order", "collect_feedback"})
 
 
-class ElicitationUnsupported(BaseModel):
-    """Payload used in place of an elicitation when the client cannot answer one."""
+def advertised_tool_name(name: str, supports_elicitation: bool) -> str | None:
+    """The name a registered tool is exposed under to a client, or None when hidden.
 
-    message: str
+    Both implementations of an eliciting tool are always registered, but a client
+    only ever sees the one matching its capabilities, and always under the
+    canonical name.
+    """
+    if name.endswith(ANSWER_TOOL_SUFFIX):
+        return name[: -len(ANSWER_TOOL_SUFFIX)] if not supports_elicitation else None
+    if name in ELICITING_TOOL_NAMES:
+        return name if supports_elicitation else None
+    return name
 
 
-def _supports_elicitation(ctx: Context) -> bool:
-    """Whether the connected client declared it can answer form elicitation requests.
+def _call_target(name: str, supports_elicitation: bool) -> str:
+    """The registered implementation to run for an exposed tool `name`."""
+    if name.endswith(ANSWER_TOOL_SUFFIX):
+        name = name[: -len(ANSWER_TOOL_SUFFIX)]
+    if name in ELICITING_TOOL_NAMES and not supports_elicitation:
+        return name + ANSWER_TOOL_SUFFIX
+    return name
+
+
+def _relabel(result: HandlerResult, internal: str, public: str) -> HandlerResult:
+    """Present an internal tool name to the client under its advertised name."""
+    if not isinstance(result, dict):
+        return result
+    content = result.get("content")
+    if not isinstance(content, list):
+        return result
+    relabelled: list[Any] = []
+    for item in content:
+        if isinstance(item, dict) and isinstance(item.get("text"), str):
+            item = {**item, "text": item["text"].replace(internal, public)}
+        relabelled.append(item)
+    return {**result, "content": relabelled}
+
+
+def _client_supports_elicitation(ctx: ServerRequestContext[Any, Any]) -> bool:
+    """Whether the connected client declared form elicitation support.
 
     Mirrors the SDK's own capability gate: a bare `elicitation: {}` counts as form
     support, while URL-only elicitation does not.
     """
-    try:
-        capabilities = ctx.client_capabilities
-    except ValueError:
-        # Outside an active request there is no client to ask.
-        return False
+    capabilities = ctx.session.client_capabilities
     elicitation = capabilities.elicitation if capabilities is not None else None
     return elicitation is not None and (elicitation.form is not None or elicitation.url is None)
 
 
-def _render_questions(schema: type[BaseModel]) -> str:
-    """The fields of `schema`, rendered as the questions to put to the user."""
-    return "\n".join(f"- {field.description or name}" for name, field in schema.model_fields.items())
+async def capability_middleware(ctx: ServerRequestContext[Any, Any], call_next: CallNext) -> HandlerResult:
+    """Expose each client only the tool variant its capabilities can run.
 
-
-def _elicit_or_message(
-    ctx: Context, prompt: str, schema: type[BaseModel], provided: BaseModel | None
-) -> Elicit[Any] | BaseModel:
-    """Ask `schema` through elicitation, use pre-supplied `provided` answers, or return a message.
-
-    Clients that support elicitation are always asked directly. A client that cannot
-    answer an elicitation can instead call the tool again with its `answers` argument;
-    until it does, the tool returns a message telling it to pose the questions to the user.
+    Rewrites the advertised tool list and the tool name being called to the set
+    matching the connection's capabilities, so the interview looks the same to an
+    agent either way.
     """
-    if _supports_elicitation(ctx):
-        return Elicit(prompt, schema)
-    if provided is not None:
-        return provided
-    return ElicitationUnsupported(
-        message=(
-            "This client does not support MCP elicitation, so this server cannot ask "
-            "the user directly. Please pose the following question(s) to the user, then "
-            "call this tool again with the `answers` argument:\n"
-            f"{prompt}\n{_render_questions(schema)}"
-        )
+    if ctx.method not in ("tools/list", "tools/call"):
+        return await call_next(ctx)
+
+    supports = _client_supports_elicitation(ctx)
+
+    if ctx.method == "tools/call":
+        params = dict(ctx.params or {})
+        name = params.get("name")
+        if isinstance(name, str):
+            target = _call_target(name, supports)
+            if target != name:
+                result = await call_next(replace(ctx, params={**params, "name": target}))
+                if target.endswith(ANSWER_TOOL_SUFFIX) and name == target[: -len(ANSWER_TOOL_SUFFIX)]:
+                    result = _relabel(result, target, name)
+                return result
+        return await call_next(ctx)
+
+    result = await call_next(ctx)
+    if isinstance(result, dict) and isinstance(result.get("tools"), list):
+        tools: list[Any] = []
+        for tool in result["tools"]:
+            advertised = advertised_tool_name(tool.get("name", ""), supports)
+            if advertised is None:
+                continue
+            tools.append({**tool, "name": advertised} if advertised != tool.get("name") else tool)
+        result = {**result, "tools": tools}
+    return result
+
+
+server.middleware.append(capability_middleware)
+
+
+def _questions_message(prompt: str, schema: type[BaseModel]) -> str:
+    """The question(s) of `schema` for a client that must relay them to the user."""
+    questions = "\n".join(
+        f"- {field.description or name}" for name, field in schema.model_fields.items()
     )
-
-
-def _unsupported_message(result: ElicitationResult[Any]) -> str | None:
-    """The fallback message when `result` is an `ElicitationUnsupported` payload."""
-    if isinstance(result, AcceptedElicitation) and isinstance(result.data, ElicitationUnsupported):
-        return result.data.message
-    return None
+    return (
+        "Please pose the following question(s) to the user, then call this tool again "
+        f"with the `answers` argument:\n{prompt}\n{questions}"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -201,30 +256,7 @@ class Greeting(BaseModel):
     wants_pizza: bool = Field(description="Would you like to order a pizza?")
 
 
-async def greet_resolver(
-    ctx: Context, answers: Greeting | None
-) -> Elicit[Greeting] | Greeting | ElicitationUnsupported:
-    _require_stage(Stage.GREETING)
-    return _elicit_or_message(ctx, "Welcome to Pizza MCP!", Greeting, answers)
-
-
-async def greet_customer(
-    result: Annotated[ElicitationResult[Greeting], Resolve(greet_resolver)],
-    answers: Greeting | None = None,
-) -> str:
-    """Greet the customer and ask how they are, how they arrived, and whether they want pizza.
-
-    Available during the greeting stage. `answers` is only needed by clients without
-    elicitation support: such a client asks the user the questions it is handed, then
-    calls this tool again with `answers` filled in.
-    """
-    if (message := _unsupported_message(result)) is not None:
-        return message
-
-    if not isinstance(result, AcceptedElicitation):
-        return "No problem. Come back whenever you feel like a pizza!"
-
-    data = result.data
+def _greet(data: Greeting) -> str:
     if not data.wants_pizza:
         return (
             f"Thanks for stopping by and {data.feeling or 'take care'}! "
@@ -236,6 +268,31 @@ async def greet_customer(
         f"Great, a pizza it is! Arriving by {data.arrival}, that works. "
         "Let's put your order together."
     )
+
+
+async def greet_resolver() -> Elicit[Greeting]:
+    _require_stage(Stage.GREETING)
+    return Elicit("Welcome to Pizza MCP!", Greeting)
+
+
+async def greet_customer(
+    result: Annotated[ElicitationResult[Greeting], Resolve(greet_resolver)],
+) -> str:
+    """Greet the customer: ask how they are doing, how they arrived and whether they want pizza."""
+    if not isinstance(result, AcceptedElicitation):
+        return "No problem. Come back whenever you feel like a pizza!"
+    return _greet(result.data)
+
+
+async def greet_customer_answers(answers: Greeting | None = None) -> str:
+    """Greet the customer: ask how they are doing, how they arrived and whether they want pizza.
+
+    Ask the user the questions this tool returns, then call it again with `answers`.
+    """
+    _require_stage(Stage.GREETING)
+    if answers is None:
+        return _questions_message("Welcome to Pizza MCP!", Greeting)
+    return _greet(answers)
 
 
 # --------------------------------------------------------------------------- #
@@ -253,36 +310,38 @@ class Order(BaseModel):
     extras: str = Field(default="", description="Anything else? Leave blank for none.")
 
 
-async def order_resolver(
-    ctx: Context, answers: Order | None
-) -> Elicit[Order] | Order | ElicitationUnsupported:
-    _require_stage(Stage.ORDER)
-    return _elicit_or_message(ctx, "Let's build your pizza.", Order, answers)
-
-
-async def take_order(
-    result: Annotated[ElicitationResult[Order], Resolve(order_resolver)],
-    answers: Order | None = None,
-) -> str:
-    """Take the pizza order: crust filling, pizza type, and any extras.
-
-    Available during the ordering stage. `answers` is only needed by clients without
-    elicitation support: such a client asks the user the questions it is handed, then
-    calls this tool again with `answers` filled in.
-    """
-    if (message := _unsupported_message(result)) is not None:
-        return message
-
-    if not isinstance(result, AcceptedElicitation):
-        _enter_stage(Stage.GREETING)
-        return "Order cancelled. Let me know if you change your mind."
-
-    data = result.data
+def _take_order(data: Order) -> str:
     order.update(crust=data.crust, pizza_type=data.pizza_type, extras=data.extras)
 
     _enter_stage(Stage.PIZZA_MAKING)
     extras = f" plus {data.extras}" if data.extras else ""
     return f"One {data.pizza_type} with {data.crust}{extras}. Let's make it!"
+
+
+async def order_resolver() -> Elicit[Order]:
+    _require_stage(Stage.ORDER)
+    return Elicit("Let's build your pizza.", Order)
+
+
+async def take_order(
+    result: Annotated[ElicitationResult[Order], Resolve(order_resolver)],
+) -> str:
+    """Take the pizza order: crust filling, pizza type and any extras."""
+    if not isinstance(result, AcceptedElicitation):
+        _enter_stage(Stage.GREETING)
+        return "Order cancelled. Let me know if you change your mind."
+    return _take_order(result.data)
+
+
+async def take_order_answers(answers: Order | None = None) -> str:
+    """Take the pizza order: crust filling, pizza type and any extras.
+
+    Ask the user the questions this tool returns, then call it again with `answers`.
+    """
+    _require_stage(Stage.ORDER)
+    if answers is None:
+        return _questions_message("Let's build your pizza.", Order)
+    return _take_order(answers)
 
 
 # --------------------------------------------------------------------------- #
@@ -353,31 +412,7 @@ class Feedback(BaseModel):
     comments: str = Field(default="", description="Anything you'd like to say? Leave blank for none.")
 
 
-async def feedback_resolver(
-    ctx: Context, answers: Feedback | None
-) -> Elicit[Feedback] | Feedback | ElicitationUnsupported:
-    _require_stage(Stage.FEEDBACK)
-    return _elicit_or_message(ctx, "Before you go, how was your experience?", Feedback, answers)
-
-
-async def collect_feedback(
-    result: Annotated[ElicitationResult[Feedback], Resolve(feedback_resolver)],
-    answers: Feedback | None = None,
-) -> str:
-    """Ask whether the customer liked their experience and collect any comments.
-
-    Available during the feedback stage. `answers` is only needed by clients without
-    elicitation support: such a client asks the user the questions it is handed, then
-    calls this tool again with `answers` filled in.
-    """
-    if (message := _unsupported_message(result)) is not None:
-        return message
-
-    if not isinstance(result, AcceptedElicitation):
-        _enter_stage(Stage.GREETING)
-        return "Thanks for visiting!"
-
-    data = result.data
+def _collect_feedback(data: Feedback) -> str:
     closing = "Grazie! We're glad you enjoyed it." if data.liked else "Sorry to hear that - we'll do better."
     if data.comments:
         closing += f" Your feedback: {data.comments}"
@@ -386,24 +421,56 @@ async def collect_feedback(
     return closing
 
 
+async def feedback_resolver() -> Elicit[Feedback]:
+    _require_stage(Stage.FEEDBACK)
+    return Elicit("Before you go, how was your experience?", Feedback)
+
+
+async def collect_feedback(
+    result: Annotated[ElicitationResult[Feedback], Resolve(feedback_resolver)],
+) -> str:
+    """Ask whether the customer liked their experience and collect any comments."""
+    if not isinstance(result, AcceptedElicitation):
+        _enter_stage(Stage.GREETING)
+        return "Thanks for visiting!"
+    return _collect_feedback(result.data)
+
+
+async def collect_feedback_answers(answers: Feedback | None = None) -> str:
+    """Ask whether the customer liked their experience and collect any comments.
+
+    Ask the user the questions this tool returns, then call it again with `answers`.
+    """
+    _require_stage(Stage.FEEDBACK)
+    if answers is None:
+        return _questions_message("Before you go, how was your experience?", Feedback)
+    return _collect_feedback(answers)
+
+
 # --------------------------------------------------------------------------- #
 # Tool registration
 # --------------------------------------------------------------------------- #
 
-STAGE_TOOLS: dict[Stage, list[Callable[..., Any]]] = {
-    Stage.GREETING: [greet_customer],
-    Stage.ORDER: [take_order],
-    Stage.PIZZA_MAKING: [make_dough, spread_dough, add_topings, bake_pizza, serve_pizza],
-    Stage.FEEDBACK: [collect_feedback],
-}
+TOOLS: list[Callable[..., Any]] = [
+    greet_customer,
+    take_order,
+    collect_feedback,
+    greet_customer_answers,
+    take_order_answers,
+    collect_feedback_answers,
+    make_dough,
+    spread_dough,
+    add_topings,
+    bake_pizza,
+    serve_pizza,
+]
 
 
 def _register_tools() -> None:
-    """Expose every tool up front; stage gating happens inside each tool."""
+    """Register every tool variant; `capability_middleware` narrows them per client."""
     order.clear()
-    for tools in STAGE_TOOLS.values():
-        for fn in tools:
-            server.add_tool(fn)
+    for fn in TOOLS:
+        server.add_tool(fn)
 
 
 _register_tools()
