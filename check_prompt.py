@@ -16,7 +16,7 @@ import json
 
 from transformers import AutoTokenizer
 
-from main import advertised_tool_name, server
+from main import advertised_name, server
 
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")  # tokenizer files only
 
@@ -25,22 +25,25 @@ def server_tools() -> list[dict]:
     """The server's registered tools, in OpenAI function-calling format.
 
     Shows the set an elicitation-capable client is exposed to; the server also
-    registers `_answers` counterparts, but only advertises them to clients that
-    cannot elicit.
+    registers an `answers` implementation of every questioning tool, but only
+    advertises it to clients that cannot elicit.
     """
-    tools = asyncio.run(server.list_tools())
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description or "",
-                "parameters": tool.input_schema or {"type": "object", "properties": {}},
-            },
-        }
-        for tool in tools
-        if advertised_tool_name(tool.name, supports_elicitation=True) is not None
-    ]
+    exposed: list[dict] = []
+    for tool in asyncio.run(server.list_tools()):
+        name = advertised_name(tool.name, supports_elicitation=True)
+        if name is None:
+            continue
+        exposed.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool.description or "",
+                    "parameters": tool.input_schema or {"type": "object", "properties": {}},
+                },
+            }
+        )
+    return exposed
 
 
 def format_tools(prompt: str) -> str:
