@@ -21,12 +21,14 @@ The stages for this server are
 1) Greeting-stage: Ask the user how they are doing and how they got here (bike/train/car/by foot).
 2) Order-stage: Ask the user a) what pizza type (margarita, speziale, four cheese), b) if they want cheese crust, sausage crust or no crust filling, c) if they would like anything else (free form entry).
 3) Serving-stage: Ask the user whether they want to eat here or take the pizza to go.
-4) Pizza-making-stage: Expose tools make_dough, spread_dough, add_topings, bake_pizza, serve_pizza. These must be called in that order; calling one out of order returns an error naming the next step. The pizza-making tools cannot be used until the order is complete, and serving the pizza ends the interview and starts a fresh one.
+4) Confirmation-stage: `confirm_order` summarizes every answer and asks the user to confirm the order. A confirmation proceeds to the pizza-making stage; a refusal returns the interview to the order stage so the user can make a corrected order.
+5) Pizza-making-stage: Expose tools make_dough, spread_dough, add_topings, bake_pizza, serve_pizza. These must be called in that order; calling one out of order returns an error naming the next step. The pizza-making tools cannot be used until the order is confirmed, and serving the pizza ends the interview and starts a fresh one.
 
 The questions are asked up front and in order: `greet_customer`, then
-`take_order`, then `choose_serving`. Only `choose_serving`, the last question,
-answers the customer; it takes everything said so far into account for that one
-response. There is no feedback stage.
+`take_order`, then `choose_serving`. `choose_serving`, the last question, answers
+the customer, taking everything said so far into account for that one response,
+and hands off to `confirm_order`; the order is only made once the customer has
+confirmed it.
 
 A tool called outside its stage returns a tool error naming the stage it expects,
 the stage the interview is currently in, the correct sequence of questions, and

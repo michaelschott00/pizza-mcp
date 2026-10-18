@@ -2,9 +2,9 @@
 
 A toy MCP server that runs a pizza-order interview. The interview asks its
 questions up front - `greet_customer`, then `take_order`, then `choose_serving`,
-always in that order - and only the last of them answers, taking everything the
-customer said into account for that one response. Only once the order is
-complete can the pizza be made. The server demonstrates three MCP features:
+always in that order - and then reads the answers back with `confirm_order`,
+which asks the customer to sign off on the summarized order. Only once the order
+is confirmed can the pizza be made. The server demonstrates three MCP features:
 
 * elicitation, with a capability-aware fallback - the interview questions are
   asked through the SDK's elicitation support (via `Resolve`/`Elicit` resolvers,
@@ -59,16 +59,17 @@ server = MCPServer(
         "Guide the customer through an interactive pizza ordering interview. Ask "
         "the questions in order: `greet_customer` (how they are doing and how they "
         "arrived), then `take_order` (the pizza), then `choose_serving` (eat here "
-        "or to go). Only `choose_serving` answers; it takes everything said so far "
-        "into account for that one response. Each question tool optionally takes a "
-        "`recommendation` - answers you derived from the customer's own words - "
-        "which are offered alongside the normal options. Every tool is always "
-        "available, but each tool only works during the stage it belongs to: the "
-        "questions must be asked in order, and the pizza-making tools "
-        "(`make_dough`, `spread_dough`, `add_topings`, `bake_pizza`, `serve_pizza`) "
-        "cannot be used until the order is complete. Calling a tool outside its "
-        "stage returns an error naming the current stage and the correct sequence "
-        "of tools to call."
+        "or to go). `choose_serving` replies with the full order and tells you to "
+        "confirm it; do so with `confirm_order`, which summarizes every answer and "
+        "asks the customer to sign off before the pizza is made. Each question tool "
+        "optionally takes a `recommendation` - answers you derived from the "
+        "customer's own words - which are offered alongside the normal options. "
+        "Every tool is always available, but each tool only works during the stage "
+        "it belongs to: the questions must be asked in order, and the pizza-making "
+        "tools (`make_dough`, `spread_dough`, `add_topings`, `bake_pizza`, "
+        "`serve_pizza`) cannot be used until the order is confirmed. Calling a tool "
+        "outside its stage returns an error naming the current stage and the "
+        "correct sequence of tools to call."
     ),
 )
 
@@ -77,6 +78,7 @@ class Stage(Enum):
     GREETING = auto()
     ORDER = auto()
     SERVING = auto()
+    CONFIRMATION = auto()
     PIZZA_MAKING = auto()
 
 
@@ -84,6 +86,7 @@ STAGE_LABELS: dict[Stage, str] = {
     Stage.GREETING: "greeting",
     Stage.ORDER: "ordering",
     Stage.SERVING: "serving",
+    Stage.CONFIRMATION: "confirmation",
     Stage.PIZZA_MAKING: "pizza-making",
 }
 
@@ -93,13 +96,14 @@ STAGE_LABELS: dict[Stage, str] = {
 STAGE_TRANSITIONS: dict[Stage, tuple[Stage, str]] = {
     Stage.GREETING: (Stage.ORDER, "greet_customer"),
     Stage.ORDER: (Stage.SERVING, "take_order"),
-    Stage.SERVING: (Stage.PIZZA_MAKING, "choose_serving"),
+    Stage.SERVING: (Stage.CONFIRMATION, "choose_serving"),
+    Stage.CONFIRMATION: (Stage.PIZZA_MAKING, "confirm_order"),
     Stage.PIZZA_MAKING: (Stage.GREETING, "serve_pizza"),
 }
 
 # The questions, in the order they have to be asked. Errors quote this so a tool
 # called out of order always names the correct sequence.
-QUESTION_SEQUENCE: tuple[str, ...] = ("greet_customer", "take_order", "choose_serving")
+QUESTION_SEQUENCE: tuple[str, ...] = ("greet_customer", "take_order", "choose_serving", "confirm_order")
 
 PIZZA_STEPS: list[str] = ["make_dough", "spread_dough", "add_topings", "bake_pizza", "serve_pizza"]
 
@@ -157,6 +161,10 @@ class ServingRecommendation(BaseModel):
     serving: Literal["eat here", "to go"] | None = Field(
         default=None, description="Would you like to eat here or take it to go?"
     )
+
+
+class Confirmation(BaseModel):
+    confirmed: bool = Field(description="Do you confirm this order?")
 
 
 def recommended_schema(schema: type[BaseModel], recommendation: BaseModel | None) -> type[BaseModel]:
@@ -275,9 +283,11 @@ class Interview:
 
     # -- domain logic ------------------------------------------------------- #
     #
-    # The three question tools only record what the customer said; none of them
+    # The question tools only record what the customer said; none of them
     # answers. `choose_serving` is the last question, so it is the one that
-    # replies, taking the whole order into account.
+    # replies, taking the whole order into account. `confirm_order` then reads
+    # every answer back and asks the customer to sign off before the pizza is
+    # made; declining sends the interview back to the ordering stage.
 
     def greet(self, data: Greeting) -> str:
         self.order.update(feeling=data.feeling, arrival=data.arrival)
@@ -291,15 +301,32 @@ class Interview:
 
     def choose_serving(self, data: Serving) -> str:
         self.order["serving"] = data.serving
-        self.enter(Stage.PIZZA_MAKING)
+        self.enter(Stage.CONFIRMATION)
+        return (
+            f"Answer {data} locked in.\n"
+            "Order complete. Confirm it once more with the user using `confirm_order`."
+        )
 
+    def summary(self) -> str:
+        """Every answer so far, laid out for the customer to confirm."""
         extras = self.order.get("extras")
         extra_note = f" plus {extras}" if extras else ""
         return (
-            f"Answer {data} locked in.\n"
-            f"One {self.order['pizza_type']} with {self.order['crust']}{extra_note}, "
-            f"{self.order['serving']}. Let's make it!"
+            "Please confirm your order:\n"
+            f"- feeling: {self.order.get('feeling', '?')}\n"
+            f"- arrival: {self.order.get('arrival', '?')}\n"
+            f"- pizza: one {self.order.get('pizza_type', '?')} "
+            f"with {self.order.get('crust', '?')}{extra_note}\n"
+            f"- serving: {self.order.get('serving', '?')}"
         )
+
+    def confirm_order(self, data: Confirmation) -> str:
+        if data.confirmed:
+            self.enter(Stage.PIZZA_MAKING)
+            return "The user confirmed the order. Proceed to `make_dough`"
+        # Send the interview back to ordering so the customer can correct it.
+        self.enter(Stage.ORDER)
+        return "The user declined the order. Start again from `take_order`"
 
     # -- capability-independent tools --------------------------------------- #
 
@@ -382,6 +409,11 @@ class Interview:
         message = Interview.SERVING_PROMPT + recommendation_note(Serving, recommendation)
         return Elicit(message, recommended_schema(Serving, recommendation))
 
+    @staticmethod
+    async def confirm_resolver() -> Elicit[Confirmation]:
+        INTERVIEW.require_stage(Stage.CONFIRMATION)
+        return Elicit(INTERVIEW.summary(), Confirmation)
+
 
 INTERVIEW = Interview()
 
@@ -438,7 +470,7 @@ class ElicitationTools(Toolset):
     """The questioning tools for clients that can answer elicitation requests."""
 
     namespace = "elicit"
-    tool_names = ("greet_customer", "take_order", "choose_serving")
+    tool_names = ("greet_customer", "take_order", "choose_serving", "confirm_order")
 
     async def greet_customer(
         self,
@@ -479,12 +511,26 @@ class ElicitationTools(Toolset):
 
         Pass `recommendation` to suggest an answer you derived from the customer's
         request; it is offered alongside the normal options. This is the last
-        question, so its result is the interview's single answer.
+        question; confirm the complete order with `confirm_order` next.
         """
         if not isinstance(result, AcceptedElicitation):
             self.interview.reset()
             return "Order cancelled. Let me know if you change your mind."
         return self.interview.choose_serving(result.data)
+
+    async def confirm_order(
+        self,
+        result: Annotated[ElicitationResult[Confirmation], Resolve(Interview.confirm_resolver)],
+    ) -> str:
+        """Read every answer back and ask the customer to confirm the order.
+
+        Summarizes the whole interview and asks the customer to sign off. Call
+        this after `choose_serving` and before the pizza-making steps.
+        """
+        if not isinstance(result, AcceptedElicitation):
+            self.interview.reset()
+            return "Order cancelled. Let me know if you change your mind."
+        return self.interview.confirm_order(result.data)
 
 
 class AnswersTools(Toolset):
@@ -496,7 +542,7 @@ class AnswersTools(Toolset):
     """
 
     namespace = "answers"
-    tool_names = ("greet_customer", "take_order", "choose_serving")
+    tool_names = ("greet_customer", "take_order", "choose_serving", "confirm_order")
 
     async def greet_customer(self, answers: Greeting) -> str:
         """Ask how the customer is doing (`feeling`) and how they arrived (`arrival`).
@@ -518,10 +564,20 @@ class AnswersTools(Toolset):
         """Ask whether the customer will `eat here` or take the pizza `to go`.
 
         Ask the customer this question before calling this tool. This is the last
-        question, so its result is the interview's single answer.
+        question; confirm the complete order with `confirm_order` next.
         """
         self.interview.require_stage(Stage.SERVING)
         return self.interview.choose_serving(answers)
+
+    async def confirm_order(self, answers: Confirmation) -> str:
+        """Read every answer back and ask the customer to confirm the order.
+
+        Before calling this tool, summarize the whole interview for the customer
+        and ask them to sign off, then pass their reply in `confirmed`. Call this
+        after `choose_serving` and before the pizza-making steps.
+        """
+        self.interview.require_stage(Stage.CONFIRMATION)
+        return self.interview.confirm_order(answers)
 
 
 # The registry: which toolset serves which client, keyed by elicitation support.
