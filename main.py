@@ -1,15 +1,22 @@
 """Pizza MCP Server.
 
-A toy MCP server that runs an interactive pizza-order interview. It demonstrates
-two MCP features:
+A toy MCP server that runs a pizza-order interview. The interview asks its
+questions up front - `greet_customer`, then `take_order`, then `choose_serving`,
+always in that order - and only the last of them answers, taking everything the
+customer said into account for that one response. Only once the order is
+complete can the pizza be made. The server demonstrates three MCP features:
 
 * elicitation, with a capability-aware fallback - the interview questions are
   asked through the SDK's elicitation support (via `Resolve`/`Elicit` resolvers,
   which work on every protocol version). Clients that cannot answer elicitation
   requests are served a different implementation of the questioning tools, whose
-  questions travel through an `answers` argument instead. Which implementation a
-  client receives is decided from the capabilities it declares when it connects,
-  so neither the tools nor the instructions have to mention the distinction.
+  questions live in the `answers` argument. Which implementation a client
+  receives is decided from the capabilities it declares when it connects, so
+  neither the tools nor the instructions have to mention the distinction.
+* recommended answers - a question tool takes an optional `recommendation`, the
+  answers the model derived from the prompt that started the conversation. They
+  are offered to the customer alongside the normal options (as form defaults in
+  the elicitation variant) so a correct guess never has to be repeated.
 * stage-gated tools - every tool is always exposed to the client, but each one
   refuses to run (with an informative error) unless the interview is currently
   in the stage it belongs to.
@@ -32,7 +39,8 @@ from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
+from pydantic.fields import FieldInfo
 
 from mcp.server import MCPServer
 from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
@@ -48,12 +56,19 @@ server = MCPServer(
     "pizza",
     title="Pizza MCP Server",
     instructions=(
-        "Guide the customer through an interactive pizza ordering interview. "
-        "Every tool is always available, but each tool only works during the stage "
-        "it belongs to. Calling a tool outside its stage returns an error telling "
-        "you which stage the interview is currently in and which tools to call to "
-        "reach the stage you need. The stages are: greeting, ordering, "
-        "pizza-making, and feedback."
+        "Guide the customer through an interactive pizza ordering interview. Ask "
+        "the questions in order: `greet_customer` (how they are doing and how they "
+        "arrived), then `take_order` (the pizza), then `choose_serving` (eat here "
+        "or to go). Only `choose_serving` answers; it takes everything said so far "
+        "into account for that one response. Each question tool optionally takes a "
+        "`recommendation` - answers you derived from the customer's own words - "
+        "which are offered alongside the normal options. Every tool is always "
+        "available, but each tool only works during the stage it belongs to: the "
+        "questions must be asked in order, and the pizza-making tools "
+        "(`make_dough`, `spread_dough`, `add_topings`, `bake_pizza`, `serve_pizza`) "
+        "cannot be used until the order is complete. Calling a tool outside its "
+        "stage returns an error naming the current stage and the correct sequence "
+        "of tools to call."
     ),
 )
 
@@ -61,23 +76,30 @@ server = MCPServer(
 class Stage(Enum):
     GREETING = auto()
     ORDER = auto()
+    SERVING = auto()
     PIZZA_MAKING = auto()
-    FEEDBACK = auto()
 
 
 STAGE_LABELS: dict[Stage, str] = {
     Stage.GREETING: "greeting",
     Stage.ORDER: "ordering",
+    Stage.SERVING: "serving",
     Stage.PIZZA_MAKING: "pizza-making",
-    Stage.FEEDBACK: "feedback",
 }
 
+# Each stage tells us the question (or serving step) that moves the interview on
+# to the next one. The questions are asked in this order and must not be
+# reordered; `serve_pizza` closes the loop by starting a fresh interview.
 STAGE_TRANSITIONS: dict[Stage, tuple[Stage, str]] = {
     Stage.GREETING: (Stage.ORDER, "greet_customer"),
-    Stage.ORDER: (Stage.PIZZA_MAKING, "take_order"),
-    Stage.PIZZA_MAKING: (Stage.FEEDBACK, "serve_pizza"),
-    Stage.FEEDBACK: (Stage.GREETING, "collect_feedback"),
+    Stage.ORDER: (Stage.SERVING, "take_order"),
+    Stage.SERVING: (Stage.PIZZA_MAKING, "choose_serving"),
+    Stage.PIZZA_MAKING: (Stage.GREETING, "serve_pizza"),
 }
+
+# The questions, in the order they have to be asked. Errors quote this so a tool
+# called out of order always names the correct sequence.
+QUESTION_SEQUENCE: tuple[str, ...] = ("greet_customer", "take_order", "choose_serving")
 
 PIZZA_STEPS: list[str] = ["make_dough", "spread_dough", "add_topings", "bake_pizza", "serve_pizza"]
 
@@ -88,12 +110,23 @@ PIZZA_STEPS: list[str] = ["make_dough", "spread_dough", "add_topings", "bake_piz
 #
 # One model per questioning tool. The same model drives elicitation (as the
 # requested schema) and the `answers` fallback (as the tool's `answers` argument).
+# Each also has a matching `...Recommendation`: the same fields, but all optional,
+# so the model may suggest only the answers it actually knows from the customer's
+# prompt. The elicitation variant fills the recommendation in as a form default
+# and names it in the prompt; the answers variant asks the customer itself, so it
+# needs no recommendation argument.
 
 
 class Greeting(BaseModel):
     feeling: str = Field(description="How are you doing today?")
     arrival: Literal["bike", "train", "car", "by foot"] = Field(description="How did you get here?")
-    wants_pizza: bool = Field(description="Would you like to order a pizza?")
+
+
+class GreetingRecommendation(BaseModel):
+    feeling: str | None = Field(default=None, description="How are you doing today?")
+    arrival: Literal["bike", "train", "car", "by foot"] | None = Field(
+        default=None, description="How did you get here?"
+    )
 
 
 class Order(BaseModel):
@@ -106,9 +139,57 @@ class Order(BaseModel):
     extras: str = Field(default="", description="Anything else? Leave blank for none.")
 
 
-class Feedback(BaseModel):
-    liked: bool = Field(description="Did you like your experience?")
-    comments: str = Field(default="", description="Anything you'd like to say? Leave blank for none.")
+class OrderRecommendation(BaseModel):
+    crust: Literal["cheese crust", "sausage crust", "no crust filling"] | None = Field(
+        default=None, description="What kind of crust filling would you like?"
+    )
+    pizza_type: Literal["margarita", "speziale", "four cheese"] | None = Field(
+        default=None, description="Which pizza would you like?"
+    )
+    extras: str | None = Field(default=None, description="Anything else? Leave blank for none.")
+
+
+class Serving(BaseModel):
+    serving: Literal["eat here", "to go"] = Field(description="Would you like to eat here or take it to go?")
+
+
+class ServingRecommendation(BaseModel):
+    serving: Literal["eat here", "to go"] | None = Field(
+        default=None, description="Would you like to eat here or take it to go?"
+    )
+
+
+def recommended_schema(schema: type[BaseModel], recommendation: BaseModel | None) -> type[BaseModel]:
+    """`schema` with the recommended values as field defaults.
+
+    The defaults are what a form-elicitation client offers the customer: every
+    option is still listed, but the recommendation is the one pre-filled, so
+    accepting a correct guess takes no typing. A recommendation may cover only
+    some of the fields; the rest stay required.
+    """
+    if recommendation is None:
+        return schema
+    fields: dict[str, Any] = {}
+    for name, field in schema.model_fields.items():
+        value = getattr(recommendation, name, None)
+        overrides = (FieldInfo(default=value),) if value is not None else ()
+        fields[name] = (field.annotation, FieldInfo.merge_field_infos(field, *overrides))
+    return create_model(schema.__name__, **fields)
+
+
+def recommendation_note(schema: type[BaseModel], recommendation: BaseModel | None) -> str:
+    """The recommendation spelled out for the prompt text, or an empty string."""
+    if recommendation is None:
+        return ""
+    suggested = {
+        name: getattr(recommendation, name)
+        for name in schema.model_fields
+        if getattr(recommendation, name, None) is not None
+    }
+    if not suggested:
+        return ""
+    lines = "\n".join(f"- {name}: {value}" for name, value in suggested.items())
+    return f"\nSuggested answers (accept or choose your own):\n{lines}"
 
 
 # --------------------------------------------------------------------------- #
@@ -124,16 +205,22 @@ class Feedback(BaseModel):
 class Interview:
     """State, stage rules, prompt texts and domain logic for the pizza interview."""
 
-    # Prompt texts, shared by the elicitation resolvers and the `answers` fallback
-    # (which renders the same text together with the field descriptions).
+    # Prompt texts for the elicitation resolvers; the answers fallback carries its
+    # questions in the `answers` field descriptions instead.
     GREET_PROMPT = "Welcome to Pizza MCP!"
     ORDER_PROMPT = "Let's build your pizza."
-    FEEDBACK_PROMPT = "Before you go, how was your experience?"
+    SERVING_PROMPT = "Almost there - how would you like your pizza?"
 
     def __init__(self) -> None:
         self.stage = Stage.GREETING
         self.pizza_step = 0
         self.order: dict[str, Any] = {}
+
+    def reset(self) -> None:
+        """Start a fresh interview, forgetting the previous order."""
+        self.stage = Stage.GREETING
+        self.pizza_step = 0
+        self.order.clear()
 
     # -- stage gating ------------------------------------------------------- #
 
@@ -145,10 +232,10 @@ class Interview:
             if stage is target:
                 break
             next_stage, tool = STAGE_TRANSITIONS[stage]
-            if stage is Stage.PIZZA_MAKING:
-                tools.extend(PIZZA_STEPS[:-1])
             tools.append(tool)
             stage = next_stage
+        # The pizza-making steps are reached through `choose_serving`; when a
+        # specific step is asked for, every earlier step comes before it too.
         if target is Stage.PIZZA_MAKING and tool_name in PIZZA_STEPS:
             tools.extend(PIZZA_STEPS[: PIZZA_STEPS.index(tool_name)])
         return tools
@@ -166,9 +253,11 @@ class Interview:
 
         steps = self._advancing_tools(stage, tool_name)
         path = ", then ".join(f"`{name}`" for name in steps)
+        sequence = ", then ".join(f"`{name}`" for name in QUESTION_SEQUENCE)
         raise ToolError(
             f"This tool is only available during the {STAGE_LABELS[stage]} stage, "
             f"but the interview is currently in the {STAGE_LABELS[self.stage]} stage. "
+            f"The questions must be asked in this order: {sequence}. "
             f"Call {path} to advance to where this tool can be used."
         )
 
@@ -184,48 +273,33 @@ class Interview:
     def complete_pizza_step(self) -> None:
         self.pizza_step += 1
 
-    # -- questions ---------------------------------------------------------- #
-
-    @staticmethod
-    def questions(prompt: str, schema: type[BaseModel]) -> str:
-        """The question(s) of `schema` for a client that must relay them to the user."""
-        questions = "\n".join(
-            f"- {field.description or name}" for name, field in schema.model_fields.items()
-        )
-        return (
-            "Please pose the following question(s) to the user, then call this tool again "
-            f"with the `answers` argument:\n{prompt}\n{questions}"
-        )
-
     # -- domain logic ------------------------------------------------------- #
+    #
+    # The three question tools only record what the customer said; none of them
+    # answers. `choose_serving` is the last question, so it is the one that
+    # replies, taking the whole order into account.
 
     def greet(self, data: Greeting) -> str:
-        if not data.wants_pizza:
-            return (
-                f"Thanks for stopping by and {data.feeling or 'take care'}! "
-                "Maybe next time you'll want a pizza."
-            )
-
+        self.order.update(feeling=data.feeling, arrival=data.arrival)
         self.enter(Stage.ORDER)
-        return (
-            f"Great, a pizza it is! Arriving by {data.arrival}, that works. "
-            "Let's put your order together."
-        )
+        return f"Answer {data} locked in."
 
     def take_order(self, data: Order) -> str:
         self.order.update(crust=data.crust, pizza_type=data.pizza_type, extras=data.extras)
+        self.enter(Stage.SERVING)
+        return f"Answer {data} locked in."
 
+    def choose_serving(self, data: Serving) -> str:
+        self.order["serving"] = data.serving
         self.enter(Stage.PIZZA_MAKING)
-        extras = f" plus {data.extras}" if data.extras else ""
-        return f"One {data.pizza_type} with {data.crust}{extras}. Let's make it!"
 
-    def collect_feedback(self, data: Feedback) -> str:
-        closing = "Grazie! We're glad you enjoyed it." if data.liked else "Sorry to hear that - we'll do better."
-        if data.comments:
-            closing += f" Your feedback: {data.comments}"
-
-        self.enter(Stage.GREETING)
-        return closing
+        extras = self.order.get("extras")
+        extra_note = f" plus {extras}" if extras else ""
+        return (
+            f"Answer {data} locked in.\n"
+            f"One {self.order['pizza_type']} with {self.order['crust']}{extra_note}, "
+            f"{self.order['serving']}. Let's make it!"
+        )
 
     # -- capability-independent tools --------------------------------------- #
 
@@ -268,14 +342,17 @@ class Interview:
         return "Baking the pizza until the crust is golden."
 
     async def serve_pizza(self) -> str:
-        """Serve the finished pizza and move on to the feedback stage.
+        """Serve the finished pizza and start a fresh interview.
 
         Available during the pizza-making stage, as step 5 of 5.
         """
         self.require_pizza_step("serve_pizza")
         self.complete_pizza_step()
-        self.enter(Stage.FEEDBACK)
-        return "Here is your pizza! Buon appetito."
+        serving = self.order.get("serving", "to go")
+        self.reset()
+        if serving == "eat here":
+            return "Here is your pizza! Enjoy it here. Buon appetito."
+        return "Here is your pizza, packed up to go. Buon appetito."
 
     # -- elicitation resolvers ---------------------------------------------- #
     #
@@ -285,20 +362,25 @@ class Interview:
     # to happen here - before the client is asked - so a tool called out of stage
     # fails without prompting. Shared state is reached through `INTERVIEW`.
 
+    # A resolver may read a tool argument by name, which is how the optional
+    # `recommendation` the model supplied reaches the question it belongs to.
     @staticmethod
-    async def greet_resolver() -> Elicit[Greeting]:
+    async def greet_resolver(recommendation: GreetingRecommendation | None = None) -> Elicit[Greeting]:
         INTERVIEW.require_stage(Stage.GREETING)
-        return Elicit(Interview.GREET_PROMPT, Greeting)
+        message = Interview.GREET_PROMPT + recommendation_note(Greeting, recommendation)
+        return Elicit(message, recommended_schema(Greeting, recommendation))
 
     @staticmethod
-    async def order_resolver() -> Elicit[Order]:
+    async def order_resolver(recommendation: OrderRecommendation | None = None) -> Elicit[Order]:
         INTERVIEW.require_stage(Stage.ORDER)
-        return Elicit(Interview.ORDER_PROMPT, Order)
+        message = Interview.ORDER_PROMPT + recommendation_note(Order, recommendation)
+        return Elicit(message, recommended_schema(Order, recommendation))
 
     @staticmethod
-    async def feedback_resolver() -> Elicit[Feedback]:
-        INTERVIEW.require_stage(Stage.FEEDBACK)
-        return Elicit(Interview.FEEDBACK_PROMPT, Feedback)
+    async def serving_resolver(recommendation: ServingRecommendation | None = None) -> Elicit[Serving]:
+        INTERVIEW.require_stage(Stage.SERVING)
+        message = Interview.SERVING_PROMPT + recommendation_note(Serving, recommendation)
+        return Elicit(message, recommended_schema(Serving, recommendation))
 
 
 INTERVIEW = Interview()
@@ -308,12 +390,14 @@ INTERVIEW = Interview()
 # Capability-aware tool exposure
 # --------------------------------------------------------------------------- #
 #
-# Every tool that asks the user a question is implemented twice, once per client
-# capability, and the implementation lives in its own namespace:
+# Every tool that asks the customer a question is implemented twice, once per
+# client capability, and the implementation lives in its own namespace:
 #
-#   * `ElicitationTools` (`elicit.*`) asks through the SDK's elicitation support.
-#   * `AnswersTools` (`answers.*`) returns the questions for the client to relay
-#     to the user and takes the user's reply back through an `answers` argument.
+#   * `ElicitationTools` (`elicit.*`) asks through the SDK's elicitation support,
+#     and takes an optional `recommendation` whose answers become form defaults.
+#   * `AnswersTools` (`answers.*`) takes the customer's reply through a single
+#     required `answers` argument; the questions live in the parameter
+#     descriptions, so the tool never has to be called twice.
 #
 # Both variants are always registered; `capability_middleware` decides per
 # connection which namespace it exposes and routes calls into it, so the
@@ -354,76 +438,90 @@ class ElicitationTools(Toolset):
     """The questioning tools for clients that can answer elicitation requests."""
 
     namespace = "elicit"
-    tool_names = ("greet_customer", "take_order", "collect_feedback")
+    tool_names = ("greet_customer", "take_order", "choose_serving")
 
     async def greet_customer(
         self,
         result: Annotated[ElicitationResult[Greeting], Resolve(Interview.greet_resolver)],
+        recommendation: GreetingRecommendation | None = None,
     ) -> str:
-        """Greet the customer: ask how they are doing, how they arrived and whether they want pizza."""
+        """Ask how the customer is doing and how they arrived.
+
+        Pass `recommendation` to suggest answers you derived from the customer's
+        request; they are offered alongside the normal options.
+        """
         if not isinstance(result, AcceptedElicitation):
+            self.interview.reset()
             return "No problem. Come back whenever you feel like a pizza!"
         return self.interview.greet(result.data)
 
     async def take_order(
         self,
         result: Annotated[ElicitationResult[Order], Resolve(Interview.order_resolver)],
+        recommendation: OrderRecommendation | None = None,
     ) -> str:
-        """Take the pizza order: crust filling, pizza type and any extras."""
+        """Ask which pizza the customer wants: crust filling, pizza type and extras.
+
+        Pass `recommendation` to suggest answers you derived from the customer's
+        request; they are offered alongside the normal options.
+        """
         if not isinstance(result, AcceptedElicitation):
-            self.interview.enter(Stage.GREETING)
+            self.interview.reset()
             return "Order cancelled. Let me know if you change your mind."
         return self.interview.take_order(result.data)
 
-    async def collect_feedback(
+    async def choose_serving(
         self,
-        result: Annotated[ElicitationResult[Feedback], Resolve(Interview.feedback_resolver)],
+        result: Annotated[ElicitationResult[Serving], Resolve(Interview.serving_resolver)],
+        recommendation: ServingRecommendation | None = None,
     ) -> str:
-        """Ask whether the customer liked their experience and collect any comments."""
+        """Ask whether the customer will eat here or take the pizza to go.
+
+        Pass `recommendation` to suggest an answer you derived from the customer's
+        request; it is offered alongside the normal options. This is the last
+        question, so its result is the interview's single answer.
+        """
         if not isinstance(result, AcceptedElicitation):
-            self.interview.enter(Stage.GREETING)
-            return "Thanks for visiting!"
-        return self.interview.collect_feedback(result.data)
+            self.interview.reset()
+            return "Order cancelled. Let me know if you change your mind."
+        return self.interview.choose_serving(result.data)
 
 
 class AnswersTools(Toolset):
     """The questioning tools for clients that cannot answer elicitation requests.
 
-    Their questions travel back through the tool's `answers` argument instead.
+    The customer's reply travels through the tool's `answers` argument instead.
+    The questions are the descriptions of that argument's fields, so the model
+    can put every question to the customer up front and call each tool once.
     """
 
     namespace = "answers"
-    tool_names = ("greet_customer", "take_order", "collect_feedback")
+    tool_names = ("greet_customer", "take_order", "choose_serving")
 
-    async def greet_customer(self, answers: Greeting | None = None) -> str:
-        """Greet the customer: ask how they are doing, how they arrived and whether they want pizza.
+    async def greet_customer(self, answers: Greeting) -> str:
+        """Ask how the customer is doing (`feeling`) and how they arrived (`arrival`).
 
-        Ask the user the questions this tool returns, then call it again with `answers`.
+        Ask the customer both questions before calling this tool.
         """
         self.interview.require_stage(Stage.GREETING)
-        if answers is None:
-            return self.interview.questions(Interview.GREET_PROMPT, Greeting)
         return self.interview.greet(answers)
 
-    async def take_order(self, answers: Order | None = None) -> str:
-        """Take the pizza order: crust filling, pizza type and any extras.
+    async def take_order(self, answers: Order) -> str:
+        """Ask which pizza the customer wants: `crust`, `pizza_type` and `extras`.
 
-        Ask the user the questions this tool returns, then call it again with `answers`.
+        Ask the customer these questions before calling this tool.
         """
         self.interview.require_stage(Stage.ORDER)
-        if answers is None:
-            return self.interview.questions(Interview.ORDER_PROMPT, Order)
         return self.interview.take_order(answers)
 
-    async def collect_feedback(self, answers: Feedback | None = None) -> str:
-        """Ask whether the customer liked their experience and collect any comments.
+    async def choose_serving(self, answers: Serving) -> str:
+        """Ask whether the customer will `eat here` or take the pizza `to go`.
 
-        Ask the user the questions this tool returns, then call it again with `answers`.
+        Ask the customer this question before calling this tool. This is the last
+        question, so its result is the interview's single answer.
         """
-        self.interview.require_stage(Stage.FEEDBACK)
-        if answers is None:
-            return self.interview.questions(Interview.FEEDBACK_PROMPT, Feedback)
-        return self.interview.collect_feedback(answers)
+        self.interview.require_stage(Stage.SERVING)
+        return self.interview.choose_serving(answers)
 
 
 # The registry: which toolset serves which client, keyed by elicitation support.

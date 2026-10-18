@@ -18,14 +18,27 @@ called outside that stage, and says which stage it is for in its description.
 
 The stages for this server are
 
-1) Greeting-stage: Ask the user how they are doing, how they got here (bike/train/car/by foot) and if they'd like to order a pizza.
-2) Order-stage: Ask the user a) if they want cheese crust, sausage crust or no crust filling, b) what pizza type (margarita, speziale, four cheese), c) if they would like anything else (free form entry)
-3) Pizza-making-stage: Expose tools make_dough, spread_dough, add_topings, bake_pizza, serve_pizza. These must be called in that order; calling one out of order returns an error naming the next step.
-4) Feedback-stage: Ask the user if they liked their experience (yes/no) and if they have anything to say (free form)
+1) Greeting-stage: Ask the user how they are doing and how they got here (bike/train/car/by foot).
+2) Order-stage: Ask the user a) what pizza type (margarita, speziale, four cheese), b) if they want cheese crust, sausage crust or no crust filling, c) if they would like anything else (free form entry).
+3) Serving-stage: Ask the user whether they want to eat here or take the pizza to go.
+4) Pizza-making-stage: Expose tools make_dough, spread_dough, add_topings, bake_pizza, serve_pizza. These must be called in that order; calling one out of order returns an error naming the next step. The pizza-making tools cannot be used until the order is complete, and serving the pizza ends the interview and starts a fresh one.
+
+The questions are asked up front and in order: `greet_customer`, then
+`take_order`, then `choose_serving`. Only `choose_serving`, the last question,
+answers the customer; it takes everything said so far into account for that one
+response. There is no feedback stage.
 
 A tool called outside its stage returns a tool error naming the stage it expects,
-the stage the interview is currently in, and the tools to call (in order) to
-reach the point where it can be used.
+the stage the interview is currently in, the correct sequence of questions, and
+the tools to call (in order) to reach the point where it can be used.
+
+## Recommended answers
+
+A question tool optionally takes a `recommendation`: answers the model derived
+from the prompt that started the conversation, filled in only where the model is
+reasonably sure. The recommendation is offered to the user alongside the normal
+options, never in place of them - as field defaults in the elicitation form, so
+accepting a correct guess takes no typing.
 
 ## References
 
