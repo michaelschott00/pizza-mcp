@@ -41,8 +41,7 @@ RUN npm install -g @modelcontextprotocol/inspector
 RUN useradd -u ${AGENT_UID} -m ${AGENT_USER} \
     && chown -R ${AGENT_UID}:${AGENT_UID} /home/${AGENT_USER} \
     && mkdir -p /home/agent/.config && chown -R ${AGENT_UID}:${AGENT_UID} /home/agent/.config \
-    && mkdir -p /home/agent/.local && chown -R ${AGENT_UID}:${AGENT_UID} /home/agent/.local \
-    && mkdir -p /workspaces/worktrees && chown -R ${AGENT_UID}:${AGENT_UID} /workspaces/worktrees
+    && mkdir -p /home/agent/.local && chown -R ${AGENT_UID}:${AGENT_UID} /home/agent/.local
 
 COPY mcp.json /home/${AGENT_USER}/.mcp-inspector/mcp.json
 RUN chown -R ${AGENT_UID}:${AGENT_UID} /home/${AGENT_USER}/.mcp-inspector
