@@ -1,3 +1,5 @@
 mcp[cli]
 transformers
 jinja2
+opentelemetry-sdk
+opentelemetry-exporter-otlp
